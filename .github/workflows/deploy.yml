@@ -1,0 +1,74 @@
+name: Deploy Peppermint to ACA
+
+on:
+  push:
+    branches:
+      - main
+    paths-ignore:
+      - 'README.md'
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+env:
+  KEY_VAULT_NAME: esmos-kv-td0bd
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Azure Login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Fetch Secrets from Key Vault
+        id: kv
+        run: |
+          echo "ACR_NAME=$(az keyvault secret show --name core-acr-name --vault-name $KEY_VAULT_NAME --query value -o tsv)" >> $GITHUB_ENV
+          echo "POSTGRES_FQDN=$(az keyvault secret show --name postgres-fqdn --vault-name $KEY_VAULT_NAME --query value -o tsv)" >> $GITHUB_ENV
+          echo "DB_USER=$(az keyvault secret show --name peppermint-db-user --vault-name $KEY_VAULT_NAME --query value -o tsv)" >> $GITHUB_ENV
+          echo "DB_PASS=$(az keyvault secret show --name peppermint-db-password --vault-name $KEY_VAULT_NAME --query value -o tsv)" >> $GITHUB_ENV
+          echo "TF_STORAGE=$(az keyvault secret show --name tf-state-storage-account --vault-name $KEY_VAULT_NAME --query value -o tsv)" >> $GITHUB_ENV
+
+      - name: Login to Azure Container Registry
+        run: |
+          az acr login --name ${{ env.ACR_NAME }}
+
+      - name: Pull and Push Official Image
+        run: |
+          docker pull pepperlabs/peppermint:latest
+          docker tag pepperlabs/peppermint:latest ${{ env.ACR_NAME }}.azurecr.io/peppermint:${{ github.sha }}
+          docker push ${{ env.ACR_NAME }}.azurecr.io/peppermint:${{ github.sha }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+
+      - name: Terraform Init
+        working-directory: terraform
+        run: |
+          terraform init \
+            -backend-config="resource_group_name=esmos-healthcare-rg" \
+            -backend-config="storage_account_name=${{ env.TF_STORAGE }}" \
+            -backend-config="container_name=tfstate" \
+            -backend-config="key=peppermint.terraform.tfstate"
+
+      - name: Terraform Apply
+        working-directory: terraform
+        env:
+          ARM_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          ARM_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          ARM_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          ARM_USE_OIDC: true
+          TF_VAR_acr_name: ${{ env.ACR_NAME }}
+          TF_VAR_db_host: ${{ env.POSTGRES_FQDN }}
+          TF_VAR_db_user: ${{ env.DB_USER }}
+          TF_VAR_db_password: ${{ env.DB_PASS }}
+          TF_VAR_image_tag: ${{ github.sha }}
+        run: |
+          terraform apply -auto-approve
